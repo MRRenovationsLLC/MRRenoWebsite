@@ -152,6 +152,18 @@ export interface Lead {
   /** Set by the INT-001 Zap once the lead reaches Roofr. */
   synced_to_roofr: boolean;
   roofr_synced_at: string | null;
+  /** Archive (migration 0017). archived = out of the inbox. */
+  archived: boolean;
+  archived_at: string | null;
+  /** Which folder inside the Archive, or null for the Archive root. */
+  archive_folder_id: string | null;
+}
+
+/** A named folder inside the leads Archive (migration 0017). */
+export interface LeadArchiveFolder {
+  id: string;
+  name: string;
+  created_at: string;
 }
 
 /** Pipeline states an admin can set by hand on the leads screen. */
