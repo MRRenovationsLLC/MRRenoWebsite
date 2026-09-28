@@ -685,8 +685,10 @@ export async function deleteQrCode(id: string) {
 
 /**
  * Leads are the one table here the public writes to, and the one whose loss
- * costs real money. Nothing on this screen deletes a lead: the only mutations
- * are the two below, both of which are recoverable.
+ * costs real money. Most mutations below are recoverable (status, Roofr flag).
+ * deleteLead is the one exception -- it is permanent -- so the UI gates it
+ * behind opening the row and a confirm prompt, and it exists mainly to clear
+ * out test and spam submissions.
  */
 
 export async function updateLeadStatus(id: string, status: string) {
@@ -716,6 +718,139 @@ export async function markLeadSyncedToRoofr(id: string, synced: boolean) {
       synced_to_roofr: synced,
       roofr_synced_at: synced ? new Date().toISOString() : null,
     })
+    .eq("id", id);
+  revalidatePath("/admin/leads");
+  revalidatePath("/admin/reports");
+}
+
+/**
+ * Permanently delete a lead. There is no undo -- this is for removing test and
+ * spam submissions, not real enquiries. The UI requires the row to be opened
+ * and a confirm dialog to be accepted before this runs.
+ *
+ * Any photos the lead uploaded live in the PRIVATE lead-photos bucket, keyed by
+ * the storage paths in photo_urls. We remove those first so deleting a lead
+ * doesn't leave orphaned files behind; storage cleanup failure is non-fatal and
+ * never blocks the row delete.
+ */
+export async function deleteLead(id: string) {
+  const supabase = createServiceRoleClient();
+
+  const { data: lead } = await supabase
+    .from("leads")
+    .select("photo_urls")
+    .eq("id", id)
+    .maybeSingle();
+
+  const paths = ((lead?.photo_urls as string[] | null) ?? []).filter(
+    (p) => p && !p.startsWith("http")
+  );
+  if (paths.length > 0) {
+    await supabase.storage.from("lead-photos").remove(paths);
+  }
+
+  await supabase.from("leads").delete().eq("id", id);
+  revalidatePath("/admin/leads");
+  revalidatePath("/admin/reports");
+}
+
+// -- LEAD ARCHIVE + FOLDERS (migration 0017) --
+
+/**
+ * The Archive is where handled/old/junk leads go to get out of the inbox
+ * without being deleted. Inside it, admins can create named folders and file
+ * leads under them. archiveLead/unarchiveLead are fully reversible; deleting a
+ * folder never deletes its leads (they fall back to the Archive root).
+ */
+
+export interface FolderActionResult {
+  ok: boolean;
+  error?: string;
+}
+
+export async function createArchiveFolder(
+  name: string
+): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  const clean = (name ?? "").trim();
+  if (clean.length === 0) return { ok: false, error: "Folder name is required." };
+  if (clean.length > 60) return { ok: false, error: "Folder name is too long." };
+  const supabase = createServiceRoleClient();
+  const { data, error } = await supabase
+    .from("lead_archive_folders")
+    .insert({ name: clean })
+    .select("id")
+    .single();
+  if (error || !data) {
+    console.error("[createArchiveFolder]", error);
+    return { ok: false, error: "Could not create folder. Please try again." };
+  }
+  revalidatePath("/admin/leads");
+  return { ok: true, id: data.id as string };
+}
+
+export async function renameArchiveFolder(
+  id: string,
+  name: string
+): Promise<FolderActionResult> {
+  const clean = (name ?? "").trim();
+  if (clean.length === 0) return { ok: false, error: "Folder name is required." };
+  if (clean.length > 60) return { ok: false, error: "Folder name is too long." };
+  const supabase = createServiceRoleClient();
+  await supabase
+    .from("lead_archive_folders")
+    .update({ name: clean })
+    .eq("id", id);
+  revalidatePath("/admin/leads");
+  return { ok: true };
+}
+
+/**
+ * Delete a folder. Leads filed in it are NOT deleted -- the FK is
+ * ON DELETE SET NULL, so they stay archived and fall back to the Archive root.
+ */
+export async function deleteArchiveFolder(id: string) {
+  const supabase = createServiceRoleClient();
+  await supabase.from("lead_archive_folders").delete().eq("id", id);
+  revalidatePath("/admin/leads");
+}
+
+/**
+ * Move a lead into the Archive. folderId picks a folder, or null files it in
+ * the Archive root. Reversible with unarchiveLead.
+ */
+export async function archiveLead(id: string, folderId: string | null = null) {
+  const supabase = createServiceRoleClient();
+  await supabase
+    .from("leads")
+    .update({
+      archived: true,
+      archived_at: new Date().toISOString(),
+      archive_folder_id: folderId,
+    })
+    .eq("id", id);
+  revalidatePath("/admin/leads");
+  revalidatePath("/admin/reports");
+}
+
+/** Move an already-archived lead between folders (null = Archive root). */
+export async function moveLeadToArchiveFolder(
+  id: string,
+  folderId: string | null
+) {
+  const supabase = createServiceRoleClient();
+  await supabase
+    .from("leads")
+    .update({ archive_folder_id: folderId })
+    .eq("id", id);
+  revalidatePath("/admin/leads");
+}
+
+/** Restore a lead from the Archive back to the inbox. */
+export async function unarchiveLead(id: string) {
+  const supabase = createServiceRoleClient();
+  await supabase
+    .from("leads")
+    .update({ archived: false, archived_at: null, archive_folder_id: null })
     .eq("id", id);
   revalidatePath("/admin/leads");
   revalidatePath("/admin/reports");
