@@ -1,8 +1,22 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { LEAD_STATUSES, type Lead } from "@/lib/supabase/types";
-import { updateLeadStatus, markLeadSyncedToRoofr } from "../../actions";
+import {
+  LEAD_STATUSES,
+  type Lead,
+  type LeadArchiveFolder,
+} from "@/lib/supabase/types";
+import {
+  updateLeadStatus,
+  markLeadSyncedToRoofr,
+  deleteLead,
+  archiveLead,
+  unarchiveLead,
+  moveLeadToArchiveFolder,
+  createArchiveFolder,
+  deleteArchiveFolder,
+  renameArchiveFolder,
+} from "../../actions";
 
 const STATUS_STYLES: Record<string, string> = {
   new: "bg-navy text-paper",
@@ -10,6 +24,9 @@ const STATUS_STYLES: Record<string, string> = {
   qualified: "bg-green-700 text-paper",
   dead: "bg-soft-navy text-muted",
 };
+
+const ROOT = "__root__";
+const NEW = "__new__";
 
 function fullName(l: Lead) {
   const n = [l.first_name, l.last_name].filter(Boolean).join(" ").trim();
@@ -56,18 +73,83 @@ function Copy({ value, label }: { value: string; label: string }) {
   );
 }
 
-type Filter = "all" | "stuck" | "new";
+type View = "inbox" | "archive";
+type InboxFilter = "all" | "stuck" | "new";
+/** "all" = every archived lead, "unfiled" = no folder, otherwise a folder id. */
+type FolderSel = "all" | "unfiled" | string;
 
 export function LeadList({
   leads,
+  folders,
   signedPhotos,
   graceMinutes,
 }: {
   leads: Lead[];
+  folders: LeadArchiveFolder[];
   signedPhotos: Record<string, string>;
   graceMinutes: number;
 }) {
-  const [filter, setFilter] = useState<Filter>("all");
+  const [view, setView] = useState<View>("inbox");
+
+  const inbox = useMemo(() => leads.filter((l) => !l.archived), [leads]);
+  const archived = useMemo(() => leads.filter((l) => l.archived), [leads]);
+
+  return (
+    <div>
+      <div className="mb-5 flex items-center gap-2">
+        {(
+          [
+            ["inbox", `Inbox (${inbox.length})`],
+            ["archive", `Archive (${archived.length})`],
+          ] as [View, string][]
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setView(key)}
+            className={`rounded-md px-3.5 py-1.5 text-sm font-semibold transition-colors ${
+              view === key
+                ? "bg-navy text-paper"
+                : "border border-faint bg-paper text-muted hover:bg-soft-navy"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {view === "inbox" ? (
+        <InboxView
+          leads={inbox}
+          folders={folders}
+          signedPhotos={signedPhotos}
+          graceMinutes={graceMinutes}
+        />
+      ) : (
+        <ArchiveView
+          leads={archived}
+          folders={folders}
+          signedPhotos={signedPhotos}
+          graceMinutes={graceMinutes}
+        />
+      )}
+    </div>
+  );
+}
+
+/* -------------------------------- INBOX -------------------------------- */
+
+function InboxView({
+  leads,
+  folders,
+  signedPhotos,
+  graceMinutes,
+}: {
+  leads: Lead[];
+  folders: LeadArchiveFolder[];
+  signedPhotos: Record<string, string>;
+  graceMinutes: number;
+}) {
+  const [filter, setFilter] = useState<InboxFilter>("all");
   const [query, setQuery] = useState("");
 
   const shown = useMemo(() => {
@@ -79,34 +161,18 @@ export function LeadList({
     } else if (filter === "new") {
       list = list.filter((l) => l.status === "new");
     }
-    const q = query.trim().toLowerCase();
-    if (q) {
-      list = list.filter((l) =>
-        [
-          fullName(l),
-          l.email,
-          l.phone,
-          l.city,
-          l.zip,
-          l.project_type,
-          l.source_channel,
-        ]
-          .filter(Boolean)
-          .some((v) => String(v).toLowerCase().includes(q))
-      );
-    }
-    return list;
+    return applySearch(list, query);
   }, [leads, filter, query, graceMinutes]);
 
   if (leads.length === 0) {
     return (
       <div className="rounded-xl border border-dashed border-faint bg-paper p-8 text-center">
         <p className="font-display font-semibold text-sm text-ink">
-          No leads yet
+          No leads in the inbox
         </p>
         <p className="mx-auto mt-2 max-w-md text-sm text-muted leading-relaxed">
-          Every enquiry from the consultation and contact forms will appear here
-          the moment it is submitted, whether or not Zapier is working.
+          Every enquiry from the consultation and contact forms appears here the
+          moment it is submitted. Archived leads live under the Archive tab.
         </p>
       </div>
     );
@@ -120,7 +186,7 @@ export function LeadList({
             ["all", `All (${leads.length})`],
             ["new", "New only"],
             ["stuck", "Not in Roofr"],
-          ] as [Filter, string][]
+          ] as [InboxFilter, string][]
         ).map(([key, label]) => (
           <button
             key={key}
@@ -150,6 +216,8 @@ export function LeadList({
             <LeadRow
               key={l.id}
               lead={l}
+              mode="inbox"
+              folders={folders}
               signedPhotos={signedPhotos}
               graceMinutes={graceMinutes}
             />
@@ -160,23 +228,292 @@ export function LeadList({
   );
 }
 
+/* ------------------------------- ARCHIVE ------------------------------- */
+
+function ArchiveView({
+  leads,
+  folders,
+  signedPhotos,
+  graceMinutes,
+}: {
+  leads: Lead[];
+  folders: LeadArchiveFolder[];
+  signedPhotos: Record<string, string>;
+  graceMinutes: number;
+}) {
+  const [sel, setSel] = useState<FolderSel>("all");
+  const [query, setQuery] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  const countIn = (s: FolderSel) =>
+    s === "all"
+      ? leads.length
+      : s === "unfiled"
+        ? leads.filter((l) => !l.archive_folder_id).length
+        : leads.filter((l) => l.archive_folder_id === s).length;
+
+  const shown = useMemo(() => {
+    let list = leads;
+    if (sel === "unfiled") list = list.filter((l) => !l.archive_folder_id);
+    else if (sel !== "all") list = list.filter((l) => l.archive_folder_id === sel);
+    return applySearch(list, query);
+  }, [leads, sel, query]);
+
+  const selectedFolder = folders.find((f) => f.id === sel) ?? null;
+
+  async function createFolder() {
+    const name = newName.trim();
+    if (!name) return;
+    setErr(null);
+    setCreating(true);
+    const res = await createArchiveFolder(name);
+    setCreating(false);
+    if (!res.ok) {
+      setErr(res.error);
+      return;
+    }
+    setNewName("");
+    setSel(res.id);
+  }
+
+  return (
+    <div>
+      {/* Folder bar */}
+      <div className="mb-4 rounded-xl border border-faint bg-paper p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <FolderChip
+            active={sel === "all"}
+            onClick={() => setSel("all")}
+            label={`All (${countIn("all")})`}
+          />
+          <FolderChip
+            active={sel === "unfiled"}
+            onClick={() => setSel("unfiled")}
+            label={`Unfiled (${countIn("unfiled")})`}
+          />
+          {folders.map((f) => (
+            <FolderChip
+              key={f.id}
+              active={sel === f.id}
+              onClick={() => setSel(f.id)}
+              label={`${f.name} (${countIn(f.id)})`}
+            />
+          ))}
+
+          <div className="ml-auto flex items-center gap-1.5">
+            <input
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") createFolder();
+              }}
+              placeholder="New folder name"
+              className="w-40 rounded-md border border-faint px-2.5 py-1 text-xs"
+            />
+            <button
+              onClick={createFolder}
+              disabled={creating || newName.trim().length === 0}
+              className="rounded-md bg-navy px-2.5 py-1 text-xs font-semibold text-paper hover:opacity-90 disabled:opacity-50"
+            >
+              Add folder
+            </button>
+          </div>
+        </div>
+
+        {err ? <p className="mt-2 text-xs text-red-700">{err}</p> : null}
+
+        {selectedFolder ? (
+          <div className="mt-2 flex items-center gap-3 border-t border-faint pt-2 text-[11px]">
+            <span className="text-muted">
+              Folder: <span className="font-semibold text-ink">{selectedFolder.name}</span>
+            </span>
+            <button
+              onClick={async () => {
+                const name = window.prompt("Rename folder:", selectedFolder.name);
+                if (name && name.trim() && name.trim() !== selectedFolder.name) {
+                  await renameArchiveFolder(selectedFolder.id, name.trim());
+                }
+              }}
+              className="font-semibold text-navy hover:text-orange"
+            >
+              Rename
+            </button>
+            <button
+              onClick={async () => {
+                if (
+                  window.confirm(
+                    `Delete the folder "${selectedFolder.name}"? The leads in it are kept -- they move back to Unfiled.`
+                  )
+                ) {
+                  await deleteArchiveFolder(selectedFolder.id);
+                  setSel("all");
+                }
+              }}
+              className="font-semibold text-red-700 hover:text-red-900"
+            >
+              Delete folder
+            </button>
+          </div>
+        ) : null}
+      </div>
+
+      <div className="mb-4 flex items-center">
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search archived leads"
+          className="ml-auto w-full sm:w-72 rounded-md border border-faint px-3 py-1.5 text-sm"
+        />
+      </div>
+
+      {leads.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-faint bg-paper p-8 text-center">
+          <p className="font-display font-semibold text-sm text-ink">
+            The Archive is empty
+          </p>
+          <p className="mx-auto mt-2 max-w-md text-sm text-muted leading-relaxed">
+            Archive a lead from the Inbox to move it out of the way without
+            deleting it. Create folders above to keep the Archive organised.
+          </p>
+        </div>
+      ) : shown.length === 0 ? (
+        <p className="py-6 text-sm text-muted">Nothing in this folder.</p>
+      ) : (
+        <div className="space-y-3">
+          {shown.map((l) => (
+            <LeadRow
+              key={l.id}
+              lead={l}
+              mode="archive"
+              folders={folders}
+              signedPhotos={signedPhotos}
+              graceMinutes={graceMinutes}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FolderChip({
+  active,
+  onClick,
+  label,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
+        active
+          ? "bg-navy text-paper"
+          : "border border-faint bg-paper text-muted hover:bg-soft-navy"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+/* -------------------------------- ROW --------------------------------- */
+
+function applySearch(list: Lead[], query: string): Lead[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return list;
+  return list.filter((l) =>
+    [
+      fullName(l),
+      l.email,
+      l.phone,
+      l.city,
+      l.zip,
+      l.project_type,
+      l.source_channel,
+    ]
+      .filter(Boolean)
+      .some((v) => String(v).toLowerCase().includes(q))
+  );
+}
+
 function LeadRow({
   lead: l,
+  mode,
+  folders,
   signedPhotos,
   graceMinutes,
 }: {
   lead: Lead;
+  mode: View;
+  folders: LeadArchiveFolder[];
   signedPhotos: Record<string, string>;
   graceMinutes: number;
 }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
-  const stuck = !l.synced_to_roofr && minutesAgo(l.created_at) > graceMinutes;
-  const pending = !l.synced_to_roofr && !stuck;
-  const photos = (l.photo_urls ?? []).map((p) =>
-    p.startsWith("http") ? p : signedPhotos[p]
-  ).filter(Boolean) as string[];
+  const stuck =
+    mode === "inbox" &&
+    !l.synced_to_roofr &&
+    minutesAgo(l.created_at) > graceMinutes;
+  const pending = mode === "inbox" && !l.synced_to_roofr && !stuck;
+  const photos = (l.photo_urls ?? [])
+    .map((p) => (p.startsWith("http") ? p : signedPhotos[p]))
+    .filter(Boolean) as string[];
+
+  const folderName = l.archive_folder_id
+    ? (folders.find((f) => f.id === l.archive_folder_id)?.name ?? "Unfiled")
+    : "Unfiled";
+
+  async function confirmDelete() {
+    if (
+      !window.confirm(
+        `Permanently delete the lead from ${fullName(l)}? This cannot be undone.`
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    await deleteLead(l.id);
+    setBusy(false);
+  }
+
+  // Resolve a folder-select value ("__root__" | "__new__" | folderId) to a
+  // folder id (or null), creating a folder first if the user picked "new".
+  async function resolveFolder(value: string): Promise<{ ok: boolean; id: string | null }> {
+    if (value === NEW) {
+      const name = window.prompt("New folder name:");
+      if (!name || !name.trim()) return { ok: false, id: null };
+      const res = await createArchiveFolder(name.trim());
+      if (!res.ok) {
+        window.alert(res.error);
+        return { ok: false, id: null };
+      }
+      return { ok: true, id: res.id };
+    }
+    return { ok: true, id: value === ROOT ? null : value };
+  }
+
+  async function onArchiveSelect(value: string) {
+    if (!value) return;
+    setBusy(true);
+    const r = await resolveFolder(value);
+    if (r.ok) await archiveLead(l.id, r.id);
+    setBusy(false);
+  }
+
+  async function onMoveSelect(value: string) {
+    if (!value) return;
+    setBusy(true);
+    const r = await resolveFolder(value);
+    if (r.ok) await moveLeadToArchiveFolder(l.id, r.id);
+    setBusy(false);
+  }
 
   return (
     <div
@@ -200,17 +537,23 @@ function LeadRow({
             <span className="rounded-full bg-soft-navy px-2 py-0.5 text-[10px] font-medium text-muted">
               {l.form_type}
             </span>
-            {stuck ? (
-              <span className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-semibold text-red-800">
-                Not in Roofr
-              </span>
-            ) : pending ? (
-              <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-900">
-                Syncing
-              </span>
+            {mode === "inbox" ? (
+              stuck ? (
+                <span className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-semibold text-red-800">
+                  Not in Roofr
+                </span>
+              ) : pending ? (
+                <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-900">
+                  Syncing
+                </span>
+              ) : (
+                <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-semibold text-green-900">
+                  In Roofr
+                </span>
+              )
             ) : (
-              <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-semibold text-green-900">
-                In Roofr
+              <span className="rounded-full bg-soft-navy px-2 py-0.5 text-[10px] font-semibold text-muted">
+                {folderName}
               </span>
             )}
           </div>
@@ -244,63 +587,87 @@ function LeadRow({
 
           <p className="mt-1 text-[11px] text-muted">
             {l.source_channel ?? "Website"}
-            {l.qr_code_slug ? ` · QR /r/${l.qr_code_slug}` : ""}
-            {l.utm_campaign ? ` · ${l.utm_campaign}` : ""}
+            {l.qr_code_slug ? ` | QR /r/${l.qr_code_slug}` : ""}
+            {l.utm_campaign ? ` | ${l.utm_campaign}` : ""}
             {photos.length > 0
-              ? ` · ${photos.length} photo${photos.length === 1 ? "" : "s"}`
+              ? ` | ${photos.length} photo${photos.length === 1 ? "" : "s"}`
               : ""}
           </p>
         </div>
 
         <div className="flex shrink-0 flex-col items-end gap-2">
-          <select
-            value={l.status}
-            disabled={busy}
-            onChange={async (e) => {
-              setBusy(true);
-              await updateLeadStatus(l.id, e.target.value);
-              setBusy(false);
-            }}
-            className="rounded border border-faint px-2 py-1 text-xs"
-          >
-            {LEAD_STATUSES.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
+          {mode === "inbox" ? (
+            <>
+              <select
+                value={l.status}
+                disabled={busy}
+                onChange={async (e) => {
+                  setBusy(true);
+                  await updateLeadStatus(l.id, e.target.value);
+                  setBusy(false);
+                }}
+                className="rounded border border-faint px-2 py-1 text-xs"
+              >
+                {LEAD_STATUSES.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
 
-          <button
-            onClick={() => setOpen((v) => !v)}
-            className="text-xs font-semibold text-navy hover:text-orange transition-colors"
-          >
-            {open ? "Hide details" : "Details"}
-          </button>
+              <button
+                onClick={() => setOpen((v) => !v)}
+                className="text-xs font-semibold text-navy hover:text-orange transition-colors"
+              >
+                {open ? "Hide details" : "Details"}
+              </button>
 
-          {!l.synced_to_roofr ? (
-            <button
-              disabled={busy}
-              onClick={async () => {
-                setBusy(true);
-                await markLeadSyncedToRoofr(l.id, true);
-                setBusy(false);
-              }}
-              className="rounded-md bg-orange px-2.5 py-1 text-[11px] font-semibold text-paper hover:opacity-90 disabled:opacity-50"
-            >
-              Mark entered in Roofr
-            </button>
+              {!l.synced_to_roofr ? (
+                <button
+                  disabled={busy}
+                  onClick={async () => {
+                    setBusy(true);
+                    await markLeadSyncedToRoofr(l.id, true);
+                    setBusy(false);
+                  }}
+                  className="rounded-md bg-orange px-2.5 py-1 text-[11px] font-semibold text-paper hover:opacity-90 disabled:opacity-50"
+                >
+                  Mark entered in Roofr
+                </button>
+              ) : (
+                <button
+                  disabled={busy}
+                  onClick={async () => {
+                    setBusy(true);
+                    await markLeadSyncedToRoofr(l.id, false);
+                    setBusy(false);
+                  }}
+                  className="text-[11px] font-semibold text-muted hover:text-orange"
+                >
+                  Undo
+                </button>
+              )}
+            </>
           ) : (
-            <button
-              disabled={busy}
-              onClick={async () => {
-                setBusy(true);
-                await markLeadSyncedToRoofr(l.id, false);
-                setBusy(false);
-              }}
-              className="text-[11px] font-semibold text-muted hover:text-orange"
-            >
-              Undo
-            </button>
+            <>
+              <button
+                onClick={() => setOpen((v) => !v)}
+                className="text-xs font-semibold text-navy hover:text-orange transition-colors"
+              >
+                {open ? "Hide details" : "Details"}
+              </button>
+              <button
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true);
+                  await unarchiveLead(l.id);
+                  setBusy(false);
+                }}
+                className="rounded-md border border-faint px-2.5 py-1 text-[11px] font-semibold text-navy hover:bg-soft-navy disabled:opacity-50"
+              >
+                Restore to inbox
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -372,6 +739,61 @@ function LeadRow({
               <span className="font-mono text-ink">{l.landing_url}</span>
             </p>
           ) : null}
+
+          {/* Actions footer */}
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-red-200 pt-3">
+            {mode === "inbox" ? (
+              <label className="flex items-center gap-1.5 text-[11px] font-semibold text-muted">
+                Archive to
+                <select
+                  value=""
+                  disabled={busy}
+                  onChange={(e) => onArchiveSelect(e.target.value)}
+                  className="rounded border border-faint px-2 py-1 text-[11px] font-normal text-ink"
+                >
+                  <option value="" disabled hidden>
+                    Choose...
+                  </option>
+                  <option value={ROOT}>Archive (no folder)</option>
+                  {folders.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.name}
+                    </option>
+                  ))}
+                  <option value={NEW}>+ New folder...</option>
+                </select>
+              </label>
+            ) : (
+              <label className="flex items-center gap-1.5 text-[11px] font-semibold text-muted">
+                Move to
+                <select
+                  value=""
+                  disabled={busy}
+                  onChange={(e) => onMoveSelect(e.target.value)}
+                  className="rounded border border-faint px-2 py-1 text-[11px] font-normal text-ink"
+                >
+                  <option value="" disabled hidden>
+                    Choose...
+                  </option>
+                  <option value={ROOT}>Unfiled (no folder)</option>
+                  {folders.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.name}
+                    </option>
+                  ))}
+                  <option value={NEW}>+ New folder...</option>
+                </select>
+              </label>
+            )}
+
+            <button
+              disabled={busy}
+              onClick={confirmDelete}
+              className="shrink-0 rounded-md border border-red-300 px-2.5 py-1 text-[11px] font-semibold text-red-700 hover:bg-red-50 disabled:opacity-50"
+            >
+              Delete lead
+            </button>
+          </div>
         </div>
       ) : null}
     </div>
@@ -384,7 +806,7 @@ function Detail({ label, value }: { label: string; value: string | null }) {
       <dt className="text-[10px] font-semibold uppercase tracking-wider text-muted">
         {label}
       </dt>
-      <dd className="mt-0.5 text-ink break-words">{value || "—"}</dd>
+      <dd className="mt-0.5 text-ink break-words">{value || "--"}</dd>
     </div>
   );
 }
