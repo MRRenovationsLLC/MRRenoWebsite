@@ -1,5 +1,9 @@
 import { createServiceRoleClient } from "@/lib/supabase/server";
-import { ROOFR_SYNC_GRACE_MINUTES, type Lead } from "@/lib/supabase/types";
+import {
+  ROOFR_SYNC_GRACE_MINUTES,
+  type Lead,
+  type LeadArchiveFolder,
+} from "@/lib/supabase/types";
 import { LeadList } from "./lead-list";
 
 export const dynamic = "force-dynamic";
@@ -15,9 +19,10 @@ export const dynamic = "force-dynamic";
  * So the screen leads with the number that matters -- leads that have not
  * reached Roofr -- rather than with a pretty table.
  *
- * Read-only apart from status and a manual "entered in Roofr" flag. There is
- * deliberately no delete: losing a lead is the failure mode this page exists
- * to prevent.
+ * Read-only apart from status and a manual "entered in Roofr" flag. Delete
+ * exists but is deliberately gated -- open the row, then confirm -- because
+ * losing a real lead is the failure mode this page exists to prevent; it is
+ * meant for clearing test and spam submissions.
  */
 
 /** Most recent N. The full history is one click away as CSV. */
@@ -67,13 +72,25 @@ function StatCard({
 export default async function AdminLeadsPage() {
   const supabase = createServiceRoleClient();
 
-  const { data, error } = await supabase
-    .from("leads")
-    .select()
-    .order("created_at", { ascending: false })
-    .limit(LEAD_LIMIT);
+  const [{ data, error }, { data: folderData }] = await Promise.all([
+    supabase
+      .from("leads")
+      .select()
+      .order("created_at", { ascending: false })
+      .limit(LEAD_LIMIT),
+    supabase
+      .from("lead_archive_folders")
+      .select()
+      .order("name", { ascending: true }),
+  ]);
 
   const leads = (data as Lead[] | null) ?? [];
+  const folders = (folderData as LeadArchiveFolder[] | null) ?? [];
+
+  // Stats describe the working inbox, not what has been tidied away. Archived
+  // leads still travel in `leads` (the Archive tab needs them) but must not
+  // inflate the "awaiting Roofr" / "not in Roofr" counts the page leads with.
+  const active = leads.filter((l) => !l.archived);
 
   // Photos live in a PRIVATE bucket and the column holds storage paths, not
   // URLs, so they need signing before the browser can load them. One batched
@@ -96,11 +113,11 @@ export default async function AdminLeadsPage() {
   const graceMs = ROOFR_SYNC_GRACE_MINUTES * 60 * 1000;
   const sinceWeek = now - 7 * 24 * 60 * 60 * 1000;
 
-  const unsynced = leads.filter((l) => !l.synced_to_roofr);
+  const unsynced = active.filter((l) => !l.synced_to_roofr);
   const stuck = unsynced.filter(
     (l) => now - new Date(l.created_at).getTime() > graceMs
   );
-  const thisWeek = leads.filter(
+  const thisWeek = active.filter(
     (l) => new Date(l.created_at).getTime() >= sinceWeek
   );
 
@@ -132,7 +149,7 @@ export default async function AdminLeadsPage() {
       ) : null}
 
       <div className="mt-8 grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard label="Total leads" value={leads.length} sub={leads.length >= LEAD_LIMIT ? `Showing latest ${LEAD_LIMIT}` : undefined} />
+        <StatCard label="Inbox leads" value={active.length} sub={leads.length >= LEAD_LIMIT ? `Showing latest ${LEAD_LIMIT}` : undefined} />
         <StatCard label="Last 7 days" value={thisWeek.length} />
         <StatCard
           label="Awaiting Roofr"
@@ -169,6 +186,7 @@ export default async function AdminLeadsPage() {
       <div className="mt-8">
         <LeadList
           leads={leads}
+          folders={folders}
           signedPhotos={signedPhotos}
           graceMinutes={ROOFR_SYNC_GRACE_MINUTES}
         />
