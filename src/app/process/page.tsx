@@ -480,8 +480,8 @@ export default async function ProcessPage({ searchParams }: PageProps) {
                 content={content}
                 slotKey="process.step.10.image"
                 fallback={{
-                  src: "/images/service-bathroom-primary-freestanding-tub-double-gray-vanity-marble-floor-mn.jpg",
-                  alt: "Completed primary bathroom remodel with a freestanding soaking tub under a picture window, twin gray shaker vanities with matte-black fixtures, rectangular black-framed mirrors, and marble tile floor.",
+                  src: "/images/bathroom/bathroom-remodel-marble-tile-shower-quartz-vanity-maple-grove-mn.jpg",
+                  alt: "Completed bathroom remodel with a marble tile shower and quartz vanity in Maple Grove, MN.",
                 }}
                 render={({ src, alt }) => (
                   <Image src={src} alt={alt} fill sizes="(min-width: 1024px) 50vw, 100vw" className="object-cover" />
