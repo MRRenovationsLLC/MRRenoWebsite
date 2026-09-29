@@ -56,8 +56,8 @@ const services: readonly ServiceEntry[] = [
     name: "Bathroom Remodeling",
     body: "From en-suite spa retreats to family-friendly mushroom baths. Tile work that lasts decades.",
     href: "/services/bathrooms",
-    image: "/images/service-bathroom-primary-freestanding-tub-double-gray-vanity-marble-floor-mn.jpg",
-    alt: "Primary bathroom remodel with a freestanding soaking tub, twin gray shaker vanities, and marble tile floor.",
+    image: "/images/bathroom/bathroom-remodel-double-vanity-walk-in-shower-maple-grove-mn.jpg",
+    alt: "Bathroom remodel with a double vanity and walk-in tiled shower in Maple Grove, MN.",
   },
   {
     slug: "basements",
