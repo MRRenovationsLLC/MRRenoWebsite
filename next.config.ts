@@ -5,7 +5,13 @@ const nextConfig: NextConfig = {
     remotePatterns: [
       {
         protocol: "https",
-        hostname: "jpcycdfayzvsbblgmmfu.supabase.co",
+        // Read from the env so a database move never needs a code change.
+        // The fallback is the current project (rebuilt 2026-10-01 after the
+        // original project was deleted).
+        hostname: new URL(
+          process.env.NEXT_PUBLIC_SUPABASE_URL ??
+            "https://pcouqsokuvroeddqbpwu.supabase.co"
+        ).hostname,
         pathname: "/storage/v1/object/public/**",
       },
     ],
